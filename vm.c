@@ -14,29 +14,7 @@
  *  - https://lwn.net/Articles/658511/
  *  - https://lwn.net/Articles/658512/
  *  - https://www.kernel.org/doc/Documentation/virtual/kvm/api.txt
- */
-const char *errors[] = {
-    "success",
-    "cannot open /dev/kvm",
-    "cannot get KVM version",
-    "failed to create virtual machine",
-    "failed to allocate memory for the code that will run inside the VM",
-    "memory allocate is lower than the program to execute",
-    "could load the program into the guest memory",
-    "failed to set the memory region to the VM",
-    "failed to create virtual CPU",
-    "cannot get the size of kvm_run struct",
-    "kvm_run size returned is smalled than expected",
-    "cannot map kvm_run struct memory to internal struct",
-
-    "cannot get sregs",
-    "failed to write sregs",
-    "failed to set registers values",
-
-    "KVM exit fail entry - HW failure reason:",
-    "KVM exit internal error - suberror:",
-    "exit reason:",
-};
+*/
 
 struct virtual_machine
 {
@@ -57,22 +35,25 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
     size_t mmap_size;
     size_t fsize;
 
-    vm->codemem_len = getpagesize() * 8192;
+    vm->codemem_len = getpagesize() * 8192 * 10;
 
     vm->kvmfd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (vm->kvmfd == -1) {
+        printf("cannot open /dev/kvm\n");
         return 1;
     }
 
     ret = ioctl(vm->kvmfd, KVM_GET_API_VERSION, NULL);
     if (ret == -1) {
-        return 2;
+        printf("cannot get KVM version\n");
+        return 1;
     }
     printf("KVM version %d\n", ret);
 
     vm->vmfd = ioctl(vm->kvmfd, KVM_CREATE_VM, (unsigned long)0);
     if (ret == -1) {
-        return 3;
+        printf("failed to create virtual machine\n");
+        return 1;
     }
 
     vm->codemem = mmap(NULL,
@@ -82,18 +63,21 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
                        -1, 0);
 
     if (vm->codemem == NULL) {
-        return 4;
+        printf("failed to allocate memory for the VM\n");
+        return 1;
     }
 
     fseek(fd, 0, SEEK_END);
     if ((fsize = ftell(fd)) > vm->codemem_len) {
-        return 5;
+        printf("binary needs more memory\n");
+        return 1;
     }
     rewind(fd);
 
     if (fread(vm->codemem, 1, fsize, fd) != fsize) {
-        return 6;
-    }    
+        printf("cannot copy the binary into mmaped memory\n");
+        return 1;
+    }
 
     struct kvm_userspace_memory_region region = {
         .slot = 0,
@@ -103,21 +87,25 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
     };
 
     if (ioctl(vm->vmfd, KVM_SET_USER_MEMORY_REGION, &region) == -1) {
-        return 7;
+        printf("kvm failed to set the user memory region\n");
+        return 1;
     }
 
     vm->vcpufd = ioctl(vm->vmfd, KVM_CREATE_VCPU, (unsigned long)0);
     if (vm->vcpufd == -1) {
-        return 8;
+        printf("kvm failed to create the VCPU\n");
+        return 1;
     }
 
     mmap_size = ioctl(vm->kvmfd, KVM_GET_VCPU_MMAP_SIZE, NULL);
     if (mmap_size == -1) {
-        return 9;
+        printf("kvm failed to return the memory mapped for kvm_run struct\n");
+        return 1;
     }
 
     if (mmap_size < sizeof(*vm->kvmrun)) {
-        return 10;
+        printf("kvm memory doesn't support kvm_run struct\n");
+        return 1;
     }
 
     vm->kvmrun = mmap(NULL,
@@ -127,7 +115,8 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
                        vm->vcpufd, 0);
 
     if (vm->kvmrun == NULL) {
-        return 11;
+        printf("problem to map kvm_run between this emulator and KVM");
+        return 1;
     }
 
     return 0;
@@ -135,22 +124,43 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
 
 int setup_registers(struct virtual_machine *vm)
 {
-    if (ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs) == -1) {
-        return 12;
+    struct kvm_enable_cap cap = {
+        .cap = KVM_CAP_PPC_PAPR,
+        .flags = 0,
+    };
+
+    struct kvm_guest_debug debug = {
+       .control = KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
+    };
+
+    if (ioctl(vm->vcpufd, KVM_ENABLE_CAP, &cap) == -1) {
+        printf("kvm failed to enabled PAPR capability\n");
+        return 1;
     }
-    vm->sregs.pvr = 0x004d0200; // power8
+
+    if (ioctl(vm->vcpufd, KVM_SET_GUEST_DEBUG, &debug) == -1) {
+        printf("kvm didn't set guest in debug mode\n");
+    }
+
+    if (ioctl(vm->vcpufd, KVM_GET_SREGS, &vm->sregs) == -1) {
+        printf("kvm failed to return current special registers\n");
+        return 1;
+    }
+    vm->sregs.pvr = 0x004b0201; // power8
 
     if (ioctl(vm->vcpufd, KVM_SET_SREGS, &vm->sregs) == -1) {
-        return 13;
+        printf("kvm failed to set special registers\n");
+        return 1;
     }
 
     struct kvm_regs regs = {
         .pc = 0x100,
-        .msr = 0x8000000000000001ULL,
+        .msr = 0x8000000000000008ULL, //64-bit, HV, Big Endian
     };
 
     if (ioctl(vm->vcpufd, KVM_SET_REGS, &regs) == -1) {
-        return 14;
+        printf("kvm failed to set registers values\n");
+        return 1;
     }
 
     return 0;
@@ -173,26 +183,41 @@ void print_regs(struct virtual_machine *vm)
 int run(struct virtual_machine *vm)
 {
     while (1) {
-        print_regs(vm);
+        //print_regs(vm);
         ioctl(vm->vcpufd, KVM_RUN, NULL);
-        print_regs(vm);
+        //print_regs(vm);
 
         switch (vm->kvmrun->exit_reason) {
             case KVM_EXIT_HLT:
                 printf("halt\n");
+                return 0;
+
+            // handling putchat only
+            case KVM_EXIT_PAPR_HCALL:
+                putchar(vm->kvmrun->papr_hcall.args[2] >> 56);
                 break;
 
             case KVM_EXIT_IO:
-                break;
+                printf("not handling IO yet\n");
+                return 1;
 
             case KVM_EXIT_FAIL_ENTRY:
-                return 15;
+                printf("HW Error: %lx\n",
+                    vm->kvmrun->fail_entry.hardware_entry_failure_reason);
+                return 1;
 
             case KVM_EXIT_INTERNAL_ERROR:
-                return 16;
+                printf("internal error: 0x%x\n",
+                    vm->kvmrun->internal.suberror);
+                return 1;
+
+            case KVM_EXIT_MMIO:
+                printf("not handling MMIO yet\n");
+                return 1;
 
             default:
-                return 17;
+                printf("==> %08x\n", vm->kvmrun->exit_reason);
+                return 1;
         }
     }
     return 0;
@@ -209,39 +234,12 @@ int main()
     if (ret == 0) {
         printf("VM created successfuly\n");
     }
-    else {
-        fprintf(stderr, "%s\n", errors[ret]);
-        return ret;
-    }
 
     ret = setup_registers(&guest);
     if (ret == 0) {
         printf("Registers set successfuly\n");
     }
-    else {
-        fprintf(stderr, "%s\n", errors[ret]);
-        return ret;
-    }
 
     ret = run(&guest);
-    if (ret == 15) {
-        fprintf(stderr, "%s %lx\n",
-                errors[ret],
-                guest.kvmrun->fail_entry.hardware_entry_failure_reason);
-    }
-    else if (ret == 16) {
-        fprintf(stderr, "%s 0x%x\n",
-                errors[ret],
-                guest.kvmrun->internal.suberror);
-    }
-    else if (ret == 17) {
-        fprintf(stderr, "%s 0x%x\n",
-                errors[ret],
-                guest.kvmrun->exit_reason);
-    }
-    else {
-        fprintf(stderr, "%s\n", errors[ret]);
-    }
-
     return ret;
 }
