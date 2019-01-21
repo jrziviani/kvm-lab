@@ -35,7 +35,8 @@ int create_vm(struct virtual_machine *vm, FILE *fd)
     size_t mmap_size;
     size_t fsize;
 
-    vm->codemem_len = getpagesize() * 8192 * 10;
+    // set 512MB of memory to this virtual machine
+    vm->codemem_len = 512 * 1024 * 1024;
 
     vm->kvmfd = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     if (vm->kvmfd == -1) {
